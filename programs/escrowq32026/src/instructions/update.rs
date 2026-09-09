@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-use crate::{Escrow, ESCROW_SEED};
+use crate::{error::ErrorCode as EscrowError, Escrow, ESCROW_SEED};
 
 #[derive(Accounts)]
 #[instruction(seed: u64)]
@@ -17,6 +17,9 @@ pub struct Update<'info> {
 
 impl<'info> Update<'info> {
 	pub fn update(&mut self, receive: u64, expiration: i64) -> Result<()> {
+		let now = Clock::get()?.unix_timestamp;
+		require!(now < self.escrow.expiration, EscrowError::EscrowExpired);
+		require!(expiration > now, EscrowError::InvalidExpiration);
 		self.escrow.receive = receive;
 		self.escrow.expiration = expiration;
 		Ok(())

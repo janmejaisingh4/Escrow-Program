@@ -1,6 +1,6 @@
 use {
     anchor_lang::{
-        prelude::msg, solana_program::instruction::Instruction,
+        prelude::msg, solana_program::clock::Clock, solana_program::instruction::Instruction,
         solana_program::program_pack::Pack, system_program::ID as SYSTEM_PROGRAM_ID,
         AccountDeserialize, InstructionData, ToAccountMetas,
     },
@@ -51,6 +51,20 @@ fn send_instruction(
     msg!("{} succeeded", label);
     msg!("  signature: {}", result.signature);
     msg!("  compute units: {}", result.compute_units_consumed);
+}
+
+fn send_instruction_expect_failure(
+    program: &mut LiteSVM,
+    payer: &Keypair,
+    label: &str,
+    instruction: Instruction,
+) {
+    let message = Message::new(&[instruction], Some(&payer.pubkey()));
+    let transaction = Transaction::new(&[payer], message, program.latest_blockhash());
+    let result = program.send_transaction(transaction);
+
+    assert!(result.is_err(), "{label} unexpectedly succeeded");
+    msg!("{} rejected as expected", label);
 }
 
 fn escrow_address(maker: &Pubkey, seed: u64) -> Pubkey {
@@ -113,6 +127,29 @@ fn make_instruction(
     }
 }
 
+fn refund_instruction(
+    maker: Pubkey,
+    mint_a: Pubkey,
+    maker_ata_a: Pubkey,
+    escrow: Pubkey,
+    vault: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: escrowq32026::id(),
+        accounts: escrowq32026::accounts::Refund {
+            maker,
+            mint_a,
+            maker_ata_a,
+            escrow,
+            vault,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: SYSTEM_PROGRAM_ID,
+        }
+        .to_account_metas(None),
+        data: escrowq32026::instruction::Refund {}.data(),
+    }
+}
+
 #[test]
 fn test_make_update_take_and_refund() {
     let (mut program, maker) = setup();
@@ -152,6 +189,7 @@ fn test_make_update_take_and_refund() {
     let take_deposit = 10_000_000;
     let initial_receive = 10_000_000;
     let updated_receive = 20_000_000;
+    let take_expiration = program.get_sysvar::<Clock>().unix_timestamp + 100;
 
     send_instruction(
         &mut program,
@@ -167,7 +205,7 @@ fn test_make_update_take_and_refund() {
             ESCROW_SEED_TAKE,
             take_deposit,
             initial_receive,
-            1_778_020_6209,
+            take_expiration,
         ),
     );
     assert_eq!(token_balance(&program, &take_vault), take_deposit);
@@ -187,14 +225,14 @@ fn test_make_update_take_and_refund() {
             data: escrowq32026::instruction::Update {
                 seed: ESCROW_SEED_TAKE,
                 receive: updated_receive,
-                expiration: 1_778_020_6309,
+                expiration: take_expiration + 100,
             }
             .data(),
         },
     );
     let updated_escrow = read_escrow(&program, &take_escrow);
     assert_eq!(updated_escrow.receive, updated_receive);
-    assert_eq!(updated_escrow.expiration, 1_778_020_6309);
+    assert_eq!(updated_escrow.expiration, take_expiration + 100);
 
     let taker_ata_a = associated_token::get_associated_token_address(&taker.pubkey(), &mint_a);
     let maker_ata_b = associated_token::get_associated_token_address(&maker_pubkey, &mint_b);
@@ -240,6 +278,7 @@ fn test_make_update_take_and_refund() {
     let refund_vault = vault_address(&refund_escrow, &mint_a);
     let refund_deposit = 30_000_000;
     let maker_a_before_refund = token_balance(&program, &maker_ata_a);
+    let refund_expiration = program.get_sysvar::<Clock>().unix_timestamp + 100;
 
     send_instruction(
         &mut program,
@@ -255,28 +294,40 @@ fn test_make_update_take_and_refund() {
             ESCROW_SEED_REFUND,
             refund_deposit,
             1,
-            1_778_020_6209,
+            refund_expiration,
         ),
     );
+
+    send_instruction_expect_failure(
+        &mut program,
+        &maker,
+        "refund",
+        refund_instruction(
+            maker_pubkey,
+            mint_a,
+            maker_ata_a,
+            refund_escrow,
+            refund_vault,
+        ),
+    );
+
+    let mut clock = program.get_sysvar::<Clock>();
+    clock.unix_timestamp = refund_expiration;
+    program.set_sysvar(&clock);
+    program.expire_blockhash();
+    msg!("Advanced clock to escrow expiration: {}", clock.unix_timestamp);
 
     send_instruction(
         &mut program,
         &maker,
-        "refund",
-        Instruction {
-            program_id: escrowq32026::id(),
-            accounts: escrowq32026::accounts::Refund {
-                maker: maker_pubkey,
-                mint_a,
-                maker_ata_a,
-                escrow: refund_escrow,
-                vault: refund_vault,
-                token_program: TOKEN_PROGRAM_ID,
-                system_program: SYSTEM_PROGRAM_ID,
-            }
-            .to_account_metas(None),
-            data: escrowq32026::instruction::Refund {}.data(),
-        },
+        "refund after expiration",
+        refund_instruction(
+            maker_pubkey,
+            mint_a,
+            maker_ata_a,
+            refund_escrow,
+            refund_vault,
+        ),
     );
     assert_eq!(token_balance(&program, &maker_ata_a), maker_a_before_refund);
     assert!(program.get_account(&refund_escrow).is_none());

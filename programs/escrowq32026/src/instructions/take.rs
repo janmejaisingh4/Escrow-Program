@@ -1,4 +1,4 @@
-use crate::{Escrow, ESCROW_SEED};
+use crate::{error::ErrorCode as EscrowError, Escrow, ESCROW_SEED};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{
@@ -82,6 +82,10 @@ pub struct Take<'info> {
 impl <'info>Take<'info>{
     //tranfer the tokens from taker to maker
     pub fn deposit(&mut self) -> Result<()>{
+        require!(
+            Clock::get()?.unix_timestamp < self.escrow.expiration,
+            EscrowError::EscrowExpired
+        );
 
         let cpl_accounts : TransferChecked<'_> = TransferChecked{
             from: self.taker_ata_b.to_account_info(),
